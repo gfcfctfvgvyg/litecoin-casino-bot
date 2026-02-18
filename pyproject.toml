@@ -9,4 +9,8 @@ dependencies = [
     "uvicorn>=0.27",
     "httpx>=0.27",
     "jinja2>=3.1",
+    "discord-py>=2.6.4",
+    "aiosqlite>=0.22.1",
+    "bitcoinlib>=0.7.7",
+    "requests>=2.32.5",
 ]

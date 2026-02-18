@@ -9,6 +9,15 @@ env/
 venv/
 ENV/
 
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets
+.env.local
+secrets.txt
+
 # IDE
 .idea/
 .vscode/
@@ -17,3 +26,6 @@ ENV/
 
 # OS
 .DS_Store
+
+# Memex
+.memex/
