@@ -5,8 +5,10 @@ import random
 import os
 import requests
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
+from collections import defaultdict
+import time
 
 # Bot setup
 intents = discord.Intents.default()
@@ -20,6 +22,19 @@ HOUSE_LTC_ADDRESS = os.getenv('HOUSE_LTC_ADDRESS')
 BLOCKCYPHER_API_KEY = os.getenv('BLOCKCYPHER_API_KEY', '')  # Optional but recommended for higher limits
 MIN_DEPOSIT_CONFIRMATIONS = 2
 LTC_TO_CHIPS = 10000  # 1 LTC = 10,000 chips
+
+# Security settings
+MIN_BET = 10  # Minimum bet amount
+MAX_BET = 10000  # Maximum bet amount per game
+BET_COOLDOWN = 3  # Seconds between bets per user
+DAILY_BONUS_AMOUNT = 100  # Daily free chips
+WITHDRAWAL_MIN = 0.001  # Minimum withdrawal in LTC
+
+# Rate limiting
+user_last_bet = defaultdict(float)
+user_bet_counts = defaultdict(int)
+RATE_LIMIT_WINDOW = 60  # seconds
+RATE_LIMIT_MAX_BETS = 20  # max bets per window
 
 # BlockCypher API
 def get_address_balance(ltc_address):
@@ -131,6 +146,28 @@ async def init_db():
             )
         ''')
         
+        # Daily bonuses tracking
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS daily_bonuses (
+                user_id INTEGER PRIMARY KEY,
+                last_claim DATETIME,
+                total_claims INTEGER DEFAULT 0
+            )
+        ''')
+        
+        # Game statistics
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS user_stats (
+                user_id INTEGER PRIMARY KEY,
+                total_bets INTEGER DEFAULT 0,
+                total_wagered INTEGER DEFAULT 0,
+                total_won INTEGER DEFAULT 0,
+                total_lost INTEGER DEFAULT 0,
+                biggest_win INTEGER DEFAULT 0,
+                games_played INTEGER DEFAULT 0
+            )
+        ''')
+        
         # Initialize house
         if HOUSE_LTC_ADDRESS:
             await db.execute('''
@@ -205,6 +242,68 @@ async def get_user_withdrawal_address(user_id):
             row = await cursor.fetchone()
             return row[0] if row and row[0] else None
 
+# Security helpers
+def check_bet_cooldown(user_id):
+    """Check if user is on cooldown"""
+    current_time = time.time()
+    last_bet_time = user_last_bet.get(user_id, 0)
+    if current_time - last_bet_time < BET_COOLDOWN:
+        return False, BET_COOLDOWN - (current_time - last_bet_time)
+    return True, 0
+
+def check_rate_limit(user_id):
+    """Check if user exceeded rate limit"""
+    current_time = time.time()
+    # Initialize if not exists
+    if user_id not in user_bet_counts:
+        user_bet_counts[user_id] = []
+    
+    # Clean old entries
+    user_bet_counts[user_id] = [t for t in user_bet_counts[user_id] if current_time - t < RATE_LIMIT_WINDOW]
+    
+    if len(user_bet_counts[user_id]) >= RATE_LIMIT_MAX_BETS:
+        return False
+    return True
+
+def update_bet_tracking(user_id):
+    """Update bet tracking for cooldown and rate limiting"""
+    current_time = time.time()
+    user_last_bet[user_id] = current_time
+    if user_id not in user_bet_counts:
+        user_bet_counts[user_id] = []
+    user_bet_counts[user_id].append(current_time)
+
+def validate_bet_amount(bet):
+    """Validate bet is within limits"""
+    if bet < MIN_BET:
+        return False, f"Minimum bet is 🪙 {MIN_BET:,}"
+    if bet > MAX_BET:
+        return False, f"Maximum bet is 🪙 {MAX_BET:,}"
+    return True, ""
+
+# Stats tracking
+async def update_user_stats(user_id, wagered, won, lost, game_type):
+    """Update user statistics"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            INSERT INTO user_stats (user_id, total_bets, total_wagered, total_won, total_lost, biggest_win, games_played)
+            VALUES (?, 1, ?, ?, ?, ?, 1)
+            ON CONFLICT(user_id) DO UPDATE SET
+                total_bets = total_bets + 1,
+                total_wagered = total_wagered + ?,
+                total_won = total_won + ?,
+                total_lost = total_lost + ?,
+                biggest_win = MAX(biggest_win, ?),
+                games_played = games_played + 1
+        ''', (user_id, wagered, won, lost, won, wagered, won, lost, won))
+        await db.commit()
+
+async def get_user_stats(user_id):
+    """Get user statistics"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT * FROM user_stats WHERE user_id = ?', (user_id,)) as cursor:
+            return await cursor.fetchone()
+
 # Deposit monitoring task
 @tasks.loop(minutes=5)
 async def check_deposits():
@@ -269,6 +368,71 @@ async def balance(ctx):
     embed.add_field(name="Chips", value=f"🪙 {user_balance:,}", inline=False)
     embed.add_field(name="LTC Value", value=f"₿ {ltc_value:.4f} LTC", inline=False)
     embed.set_footer(text=f"User: {ctx.author.name} | 1 LTC = {LTC_TO_CHIPS:,} chips")
+    await ctx.send(embed=embed)
+
+@bot.command(name='daily', aliases=['bonus'])
+async def daily_bonus(ctx):
+    """Claim your daily bonus"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT last_claim FROM daily_bonuses WHERE user_id = ?', (ctx.author.id,)) as cursor:
+            row = await cursor.fetchone()
+            
+        now = datetime.now()
+        if row:
+            last_claim = datetime.fromisoformat(row[0])
+            time_diff = now - last_claim
+            
+            if time_diff < timedelta(hours=24):
+                remaining = timedelta(hours=24) - time_diff
+                hours = int(remaining.total_seconds() // 3600)
+                minutes = int((remaining.total_seconds() % 3600) // 60)
+                await ctx.send(f"⏰ Daily bonus already claimed! Come back in {hours}h {minutes}m")
+                return
+        
+        # Give bonus
+        await update_user_balance(ctx.author.id, DAILY_BONUS_AMOUNT, ctx.author.name)
+        await log_transaction(ctx.author.id, DAILY_BONUS_AMOUNT, 'daily_bonus')
+        
+        # Update bonus tracking
+        await db.execute('''
+            INSERT INTO daily_bonuses (user_id, last_claim, total_claims)
+            VALUES (?, ?, 1)
+            ON CONFLICT(user_id) DO UPDATE SET
+                last_claim = ?,
+                total_claims = total_claims + 1
+        ''', (ctx.author.id, now.isoformat(), now.isoformat()))
+        await db.commit()
+        
+        new_balance = await get_user_balance(ctx.author.id)
+        embed = discord.Embed(title="🎁 Daily Bonus Claimed!", color=discord.Color.green())
+        embed.add_field(name="Bonus", value=f"🪙 +{DAILY_BONUS_AMOUNT:,}", inline=True)
+        embed.add_field(name="New Balance", value=f"🪙 {new_balance:,}", inline=True)
+        embed.set_footer(text="Come back tomorrow for another bonus!")
+        await ctx.send(embed=embed)
+
+@bot.command(name='stats')
+async def user_stats(ctx, user: discord.Member = None):
+    """View your gambling statistics"""
+    target = user or ctx.author
+    stats = await get_user_stats(target.id)
+    
+    if not stats:
+        await ctx.send(f"No stats yet for {target.name}!")
+        return
+    
+    _, total_bets, total_wagered, total_won, total_lost, biggest_win, games_played = stats
+    net_profit = total_won - total_lost
+    win_rate = (total_won / total_wagered * 100) if total_wagered > 0 else 0
+    
+    embed = discord.Embed(title=f"📊 Stats for {target.name}", color=discord.Color.blue())
+    embed.add_field(name="Games Played", value=f"{games_played:,}", inline=True)
+    embed.add_field(name="Total Bets", value=f"{total_bets:,}", inline=True)
+    embed.add_field(name="Total Wagered", value=f"🪙 {total_wagered:,}", inline=True)
+    embed.add_field(name="Total Won", value=f"🪙 {total_won:,}", inline=True)
+    embed.add_field(name="Total Lost", value=f"🪙 {total_lost:,}", inline=True)
+    embed.add_field(name="Net Profit", value=f"🪙 {net_profit:,}", inline=True)
+    embed.add_field(name="Biggest Win", value=f"🪙 {biggest_win:,}", inline=True)
+    embed.add_field(name="Win Rate", value=f"{win_rate:.1f}%", inline=True)
     await ctx.send(embed=embed)
 
 @bot.command(name='house')
@@ -348,6 +512,10 @@ async def withdraw(ctx, amount: float):
         await ctx.send("❌ Amount must be positive!")
         return
     
+    if amount < WITHDRAWAL_MIN:
+        await ctx.send(f"❌ Minimum withdrawal is {WITHDRAWAL_MIN} LTC ({int(WITHDRAWAL_MIN * LTC_TO_CHIPS):,} chips)")
+        return
+    
     # Check withdrawal address
     withdrawal_address = await get_user_withdrawal_address(ctx.author.id)
     if not withdrawal_address:
@@ -403,17 +571,28 @@ async def credit(ctx, user: discord.Member, ltc_amount: float):
     except:
         pass
 
-# Gambling commands (same as before)
+# Gambling commands with security
 @bot.command(name='coinflip', aliases=['cf'])
 async def coinflip(ctx, bet: int, choice: str):
     """Flip a coin! Usage: !coinflip <amount> <heads/tails>"""
+    # Security checks
+    valid, msg = validate_bet_amount(bet)
+    if not valid:
+        await ctx.send(f"❌ {msg}")
+        return
+    
+    can_bet, cooldown_remaining = check_bet_cooldown(ctx.author.id)
+    if not can_bet:
+        await ctx.send(f"⏰ Cooldown active! Wait {cooldown_remaining:.1f}s")
+        return
+    
+    if not check_rate_limit(ctx.author.id):
+        await ctx.send(f"⚠️ Rate limit exceeded! Slow down.")
+        return
+    
     choice = choice.lower()
     if choice not in ['heads', 'tails', 'h', 't']:
         await ctx.send("❌ Choose 'heads' or 'tails'!")
-        return
-    
-    if bet <= 0:
-        await ctx.send("❌ Bet must be positive!")
         return
     
     user_balance = await get_user_balance(ctx.author.id)
@@ -425,6 +604,8 @@ async def coinflip(ctx, bet: int, choice: str):
     if house_balance < bet:
         await ctx.send(f"❌ House doesn't have enough chips!")
         return
+    
+    update_bet_tracking(ctx.author.id)
     
     if choice in ['h', 'heads']:
         choice = 'heads'
@@ -444,6 +625,7 @@ async def coinflip(ctx, bet: int, choice: str):
         await update_user_balance(ctx.author.id, winnings, ctx.author.name)
         await update_house_balance(-winnings)
         await log_transaction(ctx.author.id, winnings, 'coinflip_win')
+        await update_user_stats(ctx.author.id, bet, winnings, 0, 'coinflip')
         
         new_balance = await get_user_balance(ctx.author.id)
         embed.add_field(name="Result", value=f"✅ **YOU WIN!**", inline=False)
@@ -454,6 +636,7 @@ async def coinflip(ctx, bet: int, choice: str):
         await update_user_balance(ctx.author.id, -bet, ctx.author.name)
         await update_house_balance(bet)
         await log_transaction(ctx.author.id, -bet, 'coinflip_loss')
+        await update_user_stats(ctx.author.id, bet, 0, bet, 'coinflip')
         
         new_balance = await get_user_balance(ctx.author.id)
         embed.add_field(name="Result", value=f"❌ **YOU LOSE!**", inline=False)
@@ -563,6 +746,147 @@ async def slots(ctx, bet: int):
     
     await ctx.send(embed=embed)
 
+@bot.command(name='blackjack', aliases=['bj'])
+async def blackjack(ctx, bet: int):
+    """Play Blackjack! Get closer to 21 than dealer. Usage: !blackjack <amount>"""
+    # Security checks
+    valid, msg = validate_bet_amount(bet)
+    if not valid:
+        await ctx.send(f"❌ {msg}")
+        return
+    
+    can_bet, cooldown_remaining = check_bet_cooldown(ctx.author.id)
+    if not can_bet:
+        await ctx.send(f"⏰ Cooldown active! Wait {cooldown_remaining:.1f}s")
+        return
+    
+    if not check_rate_limit(ctx.author.id):
+        await ctx.send(f"⚠️ Rate limit exceeded! Slow down.")
+        return
+    
+    user_balance = await get_user_balance(ctx.author.id)
+    if user_balance < bet:
+        await ctx.send(f"❌ Insufficient balance! You have 🪙 {user_balance:,}")
+        return
+    
+    house_balance = await get_house_balance()
+    max_payout = bet * 2
+    if house_balance < max_payout:
+        await ctx.send(f"❌ House doesn't have enough chips for max payout!")
+        return
+    
+    update_bet_tracking(ctx.author.id)
+    
+    # Create deck and deal
+    deck = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'] * 4
+    random.shuffle(deck)
+    
+    player_hand = [deck.pop(), deck.pop()]
+    dealer_hand = [deck.pop(), deck.pop()]
+    
+    def card_value(hand):
+        """Calculate hand value"""
+        value = 0
+        aces = 0
+        for card in hand:
+            if card in ['J','Q','K']:
+                value += 10
+            elif card == 'A':
+                aces += 1
+                value += 11
+            else:
+                value += int(card)
+        
+        while value > 21 and aces:
+            value -= 10
+            aces -= 1
+        return value
+    
+    player_value = card_value(player_hand)
+    dealer_value = card_value(dealer_hand)
+    
+    # Check for natural blackjack
+    if player_value == 21:
+        if dealer_value == 21:
+            # Push
+            embed = discord.Embed(title="🃏 Blackjack - Push!", color=discord.Color.gold())
+            embed.add_field(name="Your Hand", value=f"{' '.join(player_hand)} = 21", inline=False)
+            embed.add_field(name="Dealer Hand", value=f"{' '.join(dealer_hand)} = 21", inline=False)
+            embed.add_field(name="Result", value="Both Blackjack! Bet returned.", inline=False)
+            await ctx.send(embed=embed)
+            return
+        else:
+            # Player blackjack wins 2.5x
+            winnings = int(bet * 1.5)
+            await update_user_balance(ctx.author.id, winnings, ctx.author.name)
+            await update_house_balance(-winnings)
+            await log_transaction(ctx.author.id, winnings, 'blackjack_win')
+            await update_user_stats(ctx.author.id, bet, winnings, 0, 'blackjack')
+            
+            new_balance = await get_user_balance(ctx.author.id)
+            embed = discord.Embed(title="🃏 Blackjack - Natural 21!", color=discord.Color.green())
+            embed.add_field(name="Your Hand", value=f"{' '.join(player_hand)} = 21 🎉", inline=False)
+            embed.add_field(name="Dealer Hand", value=f"{' '.join(dealer_hand)} = {dealer_value}", inline=False)
+            embed.add_field(name="Winnings", value=f"🪙 +{winnings:,} (1.5x)", inline=True)
+            embed.add_field(name="New Balance", value=f"🪙 {new_balance:,}", inline=True)
+            await ctx.send(embed=embed)
+            return
+    
+    # Dealer plays (hits until 17+)
+    while dealer_value < 17:
+        dealer_hand.append(deck.pop())
+        dealer_value = card_value(dealer_hand)
+    
+    # Determine winner
+    embed = discord.Embed(title="🃏 Blackjack", color=discord.Color.gold())
+    embed.add_field(name="Your Hand", value=f"{' '.join(player_hand)} = {player_value}", inline=False)
+    embed.add_field(name="Dealer Hand", value=f"{' '.join(dealer_hand)} = {dealer_value}", inline=False)
+    
+    if player_value > 21:
+        # Player busts
+        await update_user_balance(ctx.author.id, -bet, ctx.author.name)
+        await update_house_balance(bet)
+        await log_transaction(ctx.author.id, -bet, 'blackjack_loss')
+        await update_user_stats(ctx.author.id, bet, 0, bet, 'blackjack')
+        
+        new_balance = await get_user_balance(ctx.author.id)
+        embed.add_field(name="Result", value="❌ **BUST! YOU LOSE!**", inline=False)
+        embed.add_field(name="Lost", value=f"🪙 -{bet:,}", inline=True)
+        embed.add_field(name="New Balance", value=f"🪙 {new_balance:,}", inline=True)
+        embed.color = discord.Color.red()
+    elif dealer_value > 21 or player_value > dealer_value:
+        # Player wins
+        winnings = bet
+        await update_user_balance(ctx.author.id, winnings, ctx.author.name)
+        await update_house_balance(-winnings)
+        await log_transaction(ctx.author.id, winnings, 'blackjack_win')
+        await update_user_stats(ctx.author.id, bet, winnings, 0, 'blackjack')
+        
+        new_balance = await get_user_balance(ctx.author.id)
+        result_msg = "Dealer Bust!" if dealer_value > 21 else "You Win!"
+        embed.add_field(name="Result", value=f"✅ **{result_msg}**", inline=False)
+        embed.add_field(name="Winnings", value=f"🪙 +{winnings:,}", inline=True)
+        embed.add_field(name="New Balance", value=f"🪙 {new_balance:,}", inline=True)
+        embed.color = discord.Color.green()
+    elif player_value == dealer_value:
+        # Push
+        embed.add_field(name="Result", value="🤝 **PUSH! Bet Returned**", inline=False)
+        embed.color = discord.Color.gold()
+    else:
+        # Dealer wins
+        await update_user_balance(ctx.author.id, -bet, ctx.author.name)
+        await update_house_balance(bet)
+        await log_transaction(ctx.author.id, -bet, 'blackjack_loss')
+        await update_user_stats(ctx.author.id, bet, 0, bet, 'blackjack')
+        
+        new_balance = await get_user_balance(ctx.author.id)
+        embed.add_field(name="Result", value="❌ **DEALER WINS!**", inline=False)
+        embed.add_field(name="Lost", value=f"🪙 -{bet:,}", inline=True)
+        embed.add_field(name="New Balance", value=f"🪙 {new_balance:,}", inline=True)
+        embed.color = discord.Color.red()
+    
+    await ctx.send(embed=embed)
+
 @bot.command(name='leaderboard', aliases=['lb', 'top'])
 async def leaderboard(ctx):
     """Show top players"""
@@ -606,18 +930,38 @@ async def casino_help(ctx):
     )
     
     embed.add_field(
-        name="🎲 Games",
+        name="🎁 Bonuses",
         value=(
-            "`!coinflip <bet> <h/t>` - Flip a coin (2x)\n"
-            "`!dice <bet>` - Roll dice, win on 4-6 (2x)\n"
-            "`!slots <bet>` - Spin slots, match 3 (5x)"
+            "`!daily` - Claim daily bonus (100 chips)\n"
+            "`!stats [@user]` - View gambling statistics"
         ),
         inline=False
     )
     
     embed.add_field(
-        name="📊 Stats",
+        name="🎲 Games",
+        value=(
+            "`!coinflip <bet> <h/t>` - Flip a coin (2x)\n"
+            "`!dice <bet>` - Roll dice, win on 4-6 (2x)\n"
+            "`!slots <bet>` - Spin slots, match 3 (5x)\n"
+            "`!blackjack <bet>` - Play blackjack (2x/1.5x)"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="📊 Leaderboard",
         value="`!leaderboard` - Top players",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🔒 Security",
+        value=(
+            f"Min bet: 🪙 {MIN_BET:,} | Max bet: 🪙 {MAX_BET:,}\n"
+            f"Cooldown: {BET_COOLDOWN}s between bets\n"
+            f"Rate limit: {RATE_LIMIT_MAX_BETS} bets per {RATE_LIMIT_WINDOW}s"
+        ),
         inline=False
     )
     
